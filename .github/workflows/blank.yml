@@ -26,9 +26,9 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install dependencies
-        run: npm ci || npm install
-        working-directory: STIDA_APP
+     - name: Install dependencies
+  run: npm ci || npm install
+  working-directory: ./
 
       - name: Build app
         run: npm run build
