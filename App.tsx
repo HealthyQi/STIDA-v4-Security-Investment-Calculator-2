@@ -1,5 +1,5 @@
 import React from 'react';
-import STIDACalculator from "./src/STIDACalculator";
+import STIDACalculator from "/STIDACalculator";
 
 const App: React.FC = () => {
   return (
