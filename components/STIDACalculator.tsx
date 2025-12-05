@@ -1,0 +1,649 @@
+import React, { useState, useMemo } from 'react';
+import { 
+  Shield, 
+  Settings, 
+  AlertCircle, 
+  Lock, 
+  TrendingUp, 
+  Target,
+  BarChart3,
+  List,
+  Database,
+  Edit2,
+  Plus,
+  Trash2,
+  CheckCircle2,
+  ArrowRight,
+  Calculator
+} from 'lucide-react';
+import { 
+  BarChart, 
+  Bar, 
+  XAxis, 
+  YAxis, 
+  CartesianGrid, 
+  Tooltip, 
+  Legend, 
+  ResponsiveContainer,
+  ReferenceLine,
+  ComposedChart,
+  Line,
+  Cell
+} from 'recharts';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+
+import { Card, CardHeader, CardTitle, CardDescription, CardContent } from './ui/Card';
+import { Alert, AlertTitle, AlertDescription } from './ui/Alert';
+import { Domain, Scenario, Action, DomainScore, CalculatedAction, PortfolioResult, Tier, KPI } from '../types';
+import { DEFAULT_DOMAINS, DEFAULT_SCENARIOS, DEFAULT_ACTIONS, FLOOR_THRESHOLD } from '../constants';
+
+const STIDACalculator: React.FC = () => {
+  // --- STATE ---
+  const [tier, setTier] = useState<Tier>('TIER_1');
+  const [budget, setBudget] = useState(1000000);
+  const [discountRate, setDiscountRate] = useState(0.10);
+  const [timeHorizon, setTimeHorizon] = useState(3);
+  
+  const [domains, setDomains] = useState<Domain[]>(DEFAULT_DOMAINS);
+  const [scenarios, setScenarios] = useState<Scenario[]>(DEFAULT_SCENARIOS);
+  const [actions, setActions] = useState<Action[]>(DEFAULT_ACTIONS);
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'analysis' | 'inputs'>('dashboard');
+
+  // --- HANDLERS ---
+  const handleKPIChange = (domainId: string, kpiIndex: number, field: keyof KPI, value: string | number) => {
+    setDomains(prev => prev.map(d => {
+      if (d.id !== domainId) return d;
+      const newKpis = [...d.kpis];
+      // @ts-ignore - Dynamic assignment safe due to input types
+      newKpis[kpiIndex] = { ...newKpis[kpiIndex], [field]: value };
+      return { ...d, kpis: newKpis };
+    }));
+  };
+
+  const handleCoverageChange = (domainId: string, value: number) => {
+    const clamped = Math.min(Math.max(value, 0), 1);
+    setDomains(prev => prev.map(d => {
+        if (d.id !== domainId) return d;
+        return { ...d, coverage: clamped };
+    }));
+  };
+
+  const handleAddKPI = (domainId: string) => {
+    setDomains(prev => prev.map(d => {
+      if (d.id !== domainId) return d;
+      if (d.kpis.length >= 6) return d; // Limit to 6
+      return {
+        ...d,
+        kpis: [...d.kpis, { name: 'New KPI', value: 50, weight: 0.1, dqi: 1.0 }]
+      };
+    }));
+  };
+
+  const handleRemoveKPI = (domainId: string, index: number) => {
+    setDomains(prev => prev.map(d => {
+      if (d.id !== domainId) return d;
+      const newKpis = [...d.kpis];
+      newKpis.splice(index, 1);
+      return { ...d, kpis: newKpis };
+    }));
+  };
+
+  // --- HELPER: DYNAMIC PV FACTOR ---
+  // Calculates the sum of discount factors for t=1 to horizon
+  const pvFactorSum = useMemo(() => {
+    let sum = 0;
+    for (let t = 1; t <= timeHorizon; t++) {
+      sum += 1 / Math.pow(1 + discountRate, t);
+    }
+    return sum;
+  }, [discountRate, timeHorizon]);
+
+  // --- CORE LOGIC: Portfolio Optimization ---
+  const portfolio: PortfolioResult = useMemo(() => {
+    let currentBudget = 0;
+    let totalUpfront = 0;
+    let totalAnnual = 0;
+
+    const selectedActions: CalculatedAction[] = [];
+    let availableActions = [...actions];
+
+    const calculateMetrics = (action: Action, fundedActions: Action[]): CalculatedAction => {
+      let totalDeltaALE = 0;
+      
+      scenarios.forEach(scen => {
+        const eff = action.effectiveness[scen.id];
+        if (!eff) return; 
+
+        let rawReduction = 0;
+        if (eff.type === 'PROBABILITY') {
+          rawReduction = scen.sle * scen.frequency * eff.amount;
+        } else if (eff.type === 'IMPACT') {
+          rawReduction = eff.amount * scen.frequency;
+        }
+
+        // Domain-Based Correlation Heuristic
+        let penaltySum = 0;
+        fundedActions.forEach(funded => {
+          if (funded.effectiveness[scen.id]) {
+             // Higher penalty if in same domain (diminishing returns)
+             // Lower penalty if across domains (defense in depth)
+             const rho = (funded.domainId === action.domainId) ? 0.4 : 0.15;
+             penaltySum += rho;
+          }
+        });
+
+        // Cap penalty at 80% (never strictly 0 benefit)
+        const penaltyFactor = Math.min(penaltySum * 0.2, 0.8);
+        totalDeltaALE += rawReduction * (1 - penaltyFactor);
+      });
+
+      // DYNAMIC FINANCIALS
+      const pvBenefits = totalDeltaALE * pvFactorSum;
+      const pvCosts = action.cost_upfront + (action.cost_annual * pvFactorSum);
+      const year1Cost = action.cost_upfront + action.cost_annual;
+      const npv = pvBenefits - pvCosts;
+      const roi = pvCosts > 0 ? (pvBenefits - pvCosts) / pvCosts : 0;
+      const bcr = pvCosts > 0 ? pvBenefits / pvCosts : 0;
+      const nbd = year1Cost > 0 ? totalDeltaALE / year1Cost : 0;
+      
+      const netAnnualBenefit = totalDeltaALE - action.cost_annual;
+      const paybackMonths = netAnnualBenefit > 0 ? (action.cost_upfront / netAnnualBenefit) * 12 : 999;
+
+      return { ...action, nbd, paybackMonths, npv, roi, bcr, totalDeltaALE, year1Cost };
+    };
+
+    // 1. Mandatory Floor Actions logic
+    // We calculate a temporary scores view to identify floors before portfolio application
+    const simpleScores = domains.map(d => {
+        const totalWeightDQI = d.kpis.reduce((acc, k) => acc + (k.weight * k.dqi), 0);
+        const raw = totalWeightDQI > 0 ? d.kpis.reduce((acc, k) => acc + (k.value * k.weight * k.dqi), 0) / totalWeightDQI : 0;
+        return { id: d.id, sStar: (raw/100) * d.coverage };
+    });
+    const floorViolations = simpleScores.filter(d => d.sStar < FLOOR_THRESHOLD).map(d => d.id);
+    
+    const floorActions = availableActions.filter(a => floorViolations.includes(a.domainId) || a.isFloorFix);
+    
+    floorActions.forEach(action => {
+      const y1Cost = action.cost_upfront + action.cost_annual;
+      if (currentBudget + y1Cost <= budget) {
+        const metrics = calculateMetrics(action, selectedActions); 
+        selectedActions.push({ ...metrics, reason: 'MANDATORY (Floor < 0.50)' });
+        currentBudget += y1Cost;
+        totalUpfront += action.cost_upfront;
+        totalAnnual += action.cost_annual;
+        availableActions = availableActions.filter(a => a.id !== action.id);
+      }
+    });
+
+    // 2. Optimization Loop
+    let optimizing = true;
+    while (optimizing && availableActions.length > 0) {
+      const candidates = availableActions.map(a => calculateMetrics(a, selectedActions));
+      candidates.sort((a, b) => b.nbd - a.nbd); // Sort by Net Benefit per Dollar
+      
+      const best = candidates[0];
+      if (best && currentBudget + best.year1Cost <= budget) {
+        selectedActions.push({ ...best, reason: 'Optimized (Best NBD)' });
+        currentBudget += best.year1Cost;
+        totalUpfront += best.cost_upfront;
+        totalAnnual += best.cost_annual;
+        availableActions = availableActions.filter(a => a.id !== best.id);
+      } else {
+        optimizing = false; 
+      }
+    }
+
+    return { selectedActions, totalYear1Cost: currentBudget, totalUpfront, totalAnnual };
+  }, [actions, budget, scenarios, domains, pvFactorSum]); // Dependency on pvFactorSum for financials
+
+  // --- CORE LOGIC: Domain Scoring (with DQI & Projections) ---
+  const domainScores: DomainScore[] = useMemo(() => {
+    return domains.map(d => {
+      // 1. Calculate Raw Maturity with DQI weighting
+      // Formula: Sum(Value * Weight * DQI) / Sum(Weight * DQI)
+      // DQI (0-1) acts as a confidence/quality dampener on the weight.
+      const totalAdjustedWeight = d.kpis.reduce((acc, k) => acc + (k.weight * k.dqi), 0);
+      
+      const rawScore = totalAdjustedWeight > 0 
+        ? d.kpis.reduce((acc, k) => acc + (k.value * k.weight * k.dqi), 0) / totalAdjustedWeight
+        : 0;
+      
+      const maturity = rawScore / 100;
+      const sStar = maturity * d.coverage;
+      const meetsFloor = sStar >= FLOOR_THRESHOLD;
+
+      // 2. Calculate Projected Score based on Portfolio
+      // Find funded actions for this domain
+      const fundedActions = portfolio.selectedActions.filter(a => a.domainId === d.id);
+      const totalLift = fundedActions.reduce((acc, a) => acc + (a.maturity_lift || 0), 0);
+      
+      const projectedRawScore = Math.min(rawScore + totalLift, 100);
+      const projectedSStar = (projectedRawScore / 100) * d.coverage;
+
+      return { ...d, rawScore, sStar, meetsFloor, projectedRawScore, projectedSStar };
+    });
+  }, [domains, portfolio.selectedActions]);
+
+
+  // --- RENDER HELPERS ---
+  const formatCurrency = (val: number) => 
+    new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(val);
+  
+  const formatPercent = (val: number) => 
+    `${(val * 100).toFixed(1)}%`;
+
+  const domainChartData = domainScores.map(d => ({
+    name: d.id,
+    Current: d.sStar,
+    Projected: d.projectedSStar,
+    Lift: d.projectedSStar - d.sStar,
+    Floor: FLOOR_THRESHOLD
+  }));
+
+  const portfolioChartData = portfolio.selectedActions.map((a, i) => ({
+    name: `A${i+1}`,
+    cost: a.year1Cost,
+    benefit: a.totalDeltaALE,
+    nbd: a.nbd
+  }));
+
+  return (
+    <div className="w-full max-w-7xl mx-auto p-4 space-y-6 font-sans">
+      
+      {/* HEADER */}
+      <div className="flex flex-col md:flex-row justify-between items-start md:items-center bg-slate-900 text-white p-6 rounded-lg shadow-lg gap-4">
+        <div>
+          <h1 className="text-2xl font-bold flex items-center gap-2">
+            <Shield className="w-8 h-8 text-blue-400" />
+            STIDA v4.1 Reference Calculator
+          </h1>
+          <p className="text-slate-300 text-sm mt-1">
+            {tier === 'TIER_1' ? 'Tier 1: Industry Defaults (Rapid)' : 'Tier 2: User Inputs (Detailed)'}
+          </p>
+        </div>
+        
+        <div className="flex flex-wrap items-center gap-4 bg-slate-800 p-2 rounded-lg border border-slate-700">
+           <div className="flex flex-col px-2">
+             <label className="text-[10px] uppercase text-slate-400 font-bold tracking-wider">Budget (Y1)</label>
+             <input 
+                type="number" 
+                value={budget} 
+                onChange={e => setBudget(Number(e.target.value))}
+                className="bg-transparent text-green-400 font-mono font-bold text-lg w-32 focus:outline-none"
+             />
+           </div>
+           
+           <div className="h-8 w-px bg-slate-600"></div>
+
+           <div className="flex flex-col px-2">
+             <label className="text-[10px] uppercase text-slate-400 font-bold tracking-wider">Discount Rate</label>
+             <div className="flex items-center gap-1">
+               <input 
+                  type="number" 
+                  step="0.01"
+                  value={discountRate} 
+                  onChange={e => setDiscountRate(Number(e.target.value))}
+                  className="bg-transparent text-white font-mono font-bold text-lg w-16 focus:outline-none"
+               />
+               <span className="text-slate-400 text-xs">%</span>
+             </div>
+           </div>
+
+           <div className="h-8 w-px bg-slate-600"></div>
+
+           <div className="flex flex-col px-2">
+             <label className="text-[10px] uppercase text-slate-400 font-bold tracking-wider">Horizon (Yrs)</label>
+             <input 
+                type="number" 
+                value={timeHorizon} 
+                onChange={e => setTimeHorizon(Number(e.target.value))}
+                className="bg-transparent text-white font-mono font-bold text-lg w-12 focus:outline-none"
+             />
+           </div>
+           
+           <button 
+                onClick={() => setTier(tier === 'TIER_1' ? 'TIER_2' : 'TIER_1')}
+                className="ml-2 flex items-center gap-2 bg-slate-700 hover:bg-slate-600 px-3 py-2 rounded text-xs font-bold transition-colors uppercase tracking-wider"
+            >
+                <Settings className="w-3 h-3" />
+                {tier === 'TIER_1' ? 'Switch to T2' : 'Switch to T1'}
+            </button>
+        </div>
+      </div>
+
+      {/* TABS NAVIGATION */}
+      <div className="flex gap-2 border-b border-slate-200">
+        <button 
+          onClick={() => setActiveTab('dashboard')}
+          className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors flex items-center gap-2 ${activeTab === 'dashboard' ? 'border-blue-500 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-800'}`}
+        >
+          <BarChart3 className="w-4 h-4" />
+          Executive Dashboard
+        </button>
+        <button 
+          onClick={() => setActiveTab('analysis')}
+          className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors flex items-center gap-2 ${activeTab === 'analysis' ? 'border-blue-500 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-800'}`}
+        >
+          <TrendingUp className="w-4 h-4" />
+          Financial Analysis
+        </button>
+        <button 
+          onClick={() => setActiveTab('inputs')}
+          className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors flex items-center gap-2 ${activeTab === 'inputs' ? 'border-blue-500 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-800'}`}
+        >
+          <Database className="w-4 h-4" />
+          Data Inputs & DQI
+        </button>
+      </div>
+
+      {/* DASHBOARD TAB */}
+      {activeTab === 'dashboard' && (
+        <div className="space-y-6">
+            
+            {/* FLOORS ALERT */}
+            {domainScores.some(d => !d.meetsFloor) && (
+                <Alert variant="destructive" className="bg-red-50 border-red-200">
+                    <AlertCircle className="h-4 w-4 text-red-600" />
+                    <AlertTitle className="text-red-800 font-bold">Critical Floor Violations Detected (Below {FLOOR_THRESHOLD})</AlertTitle>
+                    <AlertDescription className="text-red-700 text-sm">
+                        Remediation is mandatory. These domains are prioritized for funding regardless of ROI.
+                    </AlertDescription>
+                </Alert>
+            )}
+
+            {/* DOMAIN SCORES (GRID) */}
+            <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+                {domainScores.map(domain => (
+                    <Card key={domain.id} className={`${!domain.meetsFloor ? 'border-red-400 ring-1 ring-red-400' : ''} overflow-hidden`}>
+                        <CardHeader className="p-4 pb-2 bg-slate-50 border-b border-slate-100">
+                            <div className="flex justify-between items-start">
+                                <CardTitle className="text-sm font-bold text-slate-600">{domain.id}</CardTitle>
+                                <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">{domain.name}</span>
+                            </div>
+                        </CardHeader>
+                        <CardContent className="p-4 pt-4">
+                            <div className="flex items-end gap-2 mb-1">
+                                <div className={`text-3xl font-bold ${!domain.meetsFloor ? 'text-red-600' : 'text-slate-800'}`}>
+                                    {formatPercent(domain.sStar)}
+                                </div>
+                                {domain.projectedSStar > domain.sStar && (
+                                  <div className="text-sm font-bold text-green-500 mb-1 flex items-center">
+                                    <ArrowRight className="w-3 h-3 mx-1" />
+                                    {formatPercent(domain.projectedSStar)}
+                                  </div>
+                                )}
+                            </div>
+                            
+                            <div className="text-xs text-slate-400 mb-3 flex justify-between">
+                                <span>Maturity: {domain.rawScore.toFixed(0)}</span>
+                                <span>Cov: {(domain.coverage * 100).toFixed(0)}%</span>
+                            </div>
+
+                            {/* PROGRESS BAR WITH GHOST LIFT */}
+                            <div className="relative w-full bg-slate-200 h-2 rounded-full overflow-hidden">
+                                {/* Projected (Ghost) */}
+                                <div 
+                                    className="absolute top-0 left-0 h-full bg-green-200" 
+                                    style={{ width: `${Math.min(domain.projectedSStar * 100, 100)}%` }}
+                                />
+                                {/* Current (Solid) */}
+                                <div 
+                                    className={`absolute top-0 left-0 h-full ${!domain.meetsFloor ? 'bg-red-500' : 'bg-slate-800'}`} 
+                                    style={{ width: `${domain.sStar * 100}%` }}
+                                />
+                                {/* Floor Marker */}
+                                <div className="absolute top-0 bottom-0 w-0.5 bg-black z-10 opacity-30" style={{ left: `${FLOOR_THRESHOLD * 100}%` }}></div>
+                            </div>
+                            
+                            {!domain.meetsFloor && <div className="text-[10px] text-red-500 font-bold mt-2 flex items-center gap-1"><Lock className="w-3 h-3"/> FLOOR VIOLATION</div>}
+                        </CardContent>
+                    </Card>
+                ))}
+            </div>
+
+            {/* PORTFOLIO TABLE */}
+            <Card>
+                <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                        <TrendingUp className="w-5 h-5 text-blue-600" />
+                        Optimized Investment Portfolio
+                    </CardTitle>
+                    <CardDescription>
+                         Prioritized by Floor Requirements, then Net Benefit per Dollar (NBD). Includes Opex tail.
+                    </CardDescription>
+                </CardHeader>
+                <CardContent>
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                            <thead className="bg-slate-50 text-slate-500 border-b">
+                                <tr>
+                                    <th className="text-left p-3">Action</th>
+                                    <th className="text-left p-3">Rationale</th>
+                                    <th className="text-right p-3">Year 1 Cost</th>
+                                    <th className="text-right p-3">3yr NPV Benefit</th>
+                                    <th className="text-right p-3 font-bold text-blue-700">NBD</th>
+                                    <th className="text-right p-3">Payback</th>
+                                    <th className="text-right p-3">ROI</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {portfolio.selectedActions.map((action, idx) => (
+                                    <tr key={action.id} className="border-b hover:bg-slate-50">
+                                        <td className="p-3">
+                                            <div className="font-bold text-slate-800">{idx + 1}. {action.name}</div>
+                                            <div className="text-xs text-slate-500">
+                                                {action.id} • Lift: +{action.maturity_lift} pts ({action.domainId})
+                                            </div>
+                                        </td>
+                                        <td className="p-3">
+                                            <span className={`px-2 py-1 rounded text-xs font-medium ${
+                                                action.reason?.includes('MANDATORY') ? 'bg-red-100 text-red-800' : 'bg-green-100 text-green-800'
+                                            }`}>
+                                                {action.reason}
+                                            </span>
+                                        </td>
+                                        <td className="p-3 text-right font-mono">
+                                            {formatCurrency(action.year1Cost)}
+                                            <div className="text-[10px] text-slate-400">
+                                                (Up: {formatCurrency(action.cost_upfront)})
+                                            </div>
+                                        </td>
+                                        <td className="p-3 text-right font-mono text-green-600">
+                                            {formatCurrency(action.totalDeltaALE * pvFactorSum)}
+                                        </td>
+                                        <td className="p-3 text-right font-bold text-blue-700">{action.nbd.toFixed(2)}x</td>
+                                        <td className="p-3 text-right text-slate-600">{action.paybackMonths.toFixed(1)} mo</td>
+                                        <td className="p-3 text-right text-slate-600">{formatPercent(action.roi)}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <div className="mt-4 p-4 bg-slate-50 rounded flex justify-between items-center text-sm">
+                        <div className="flex gap-6">
+                            <div className="flex flex-col">
+                                <span className="text-slate-500 text-xs uppercase font-bold">Total Y1 Cost</span>
+                                <span className="font-bold text-slate-800 font-mono">{formatCurrency(portfolio.totalYear1Cost)}</span>
+                            </div>
+                            <div className="flex flex-col">
+                                <span className="text-slate-500 text-xs uppercase font-bold">Total Opex (Annual)</span>
+                                <span className="font-medium text-slate-600 font-mono">{formatCurrency(portfolio.totalAnnual)}</span>
+                            </div>
+                        </div>
+                        <div className="text-right">
+                             <span className="text-slate-500 mr-2">Budget Utilization</span>
+                             <span className={`font-bold ${portfolio.totalYear1Cost > budget ? 'text-red-600' : 'text-green-600'}`}>
+                                {((portfolio.totalYear1Cost / budget) * 100).toFixed(1)}%
+                             </span>
+                        </div>
+                    </div>
+                </CardContent>
+            </Card>
+        </div>
+      )}
+
+      {/* ANALYSIS TAB */}
+      {activeTab === 'analysis' && (
+        <div className="space-y-6">
+           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <Card>
+                  <CardHeader>
+                      <CardTitle>Maturity Lift Projection</CardTitle>
+                      <CardDescription>Impact of funded actions on S* effectiveness</CardDescription>
+                  </CardHeader>
+                  <CardContent className="h-80">
+                      <ResponsiveContainer width="100%" height="100%">
+                          <BarChart data={domainChartData} margin={{top: 20, right: 30, left: 0, bottom: 5}}>
+                              <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                              <XAxis dataKey="name" />
+                              <YAxis domain={[0, 1]} tickFormatter={val => `${val*100}%`} />
+                              <Tooltip formatter={(val: number) => `${(val*100).toFixed(0)}%`} />
+                              <Legend />
+                              <ReferenceLine y={FLOOR_THRESHOLD} stroke="red" strokeDasharray="3 3" label="Floor" />
+                              <Bar dataKey="Current" fill="#334155" stackId="a" />
+                              <Bar dataKey="Lift" fill="#4ade80" stackId="a" name="Projected Lift" />
+                          </BarChart>
+                      </ResponsiveContainer>
+                  </CardContent>
+              </Card>
+
+              <Card>
+                  <CardHeader>
+                      <CardTitle>Cost Efficiency (NBD)</CardTitle>
+                      <CardDescription>Net Benefit per Dollar for Top Actions</CardDescription>
+                  </CardHeader>
+                  <CardContent className="h-80">
+                      <ResponsiveContainer width="100%" height="100%">
+                          <BarChart data={portfolioChartData} layout="vertical" margin={{top: 5, right: 30, left: 20, bottom: 5}}>
+                              <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+                              <XAxis type="number" />
+                              <YAxis dataKey="name" type="category" width={40}/>
+                              <Tooltip cursor={{fill: 'transparent'}} />
+                              <Bar dataKey="nbd" fill="#3b82f6" radius={[0, 4, 4, 0]}>
+                                {portfolioChartData.map((entry, index) => (
+                                    <Cell key={`cell-${index}`} fill={entry.nbd > 2 ? '#22c55e' : '#3b82f6'} />
+                                ))}
+                              </Bar>
+                          </BarChart>
+                      </ResponsiveContainer>
+                  </CardContent>
+              </Card>
+           </div>
+        </div>
+      )}
+
+      {/* INPUTS TAB */}
+      {activeTab === 'inputs' && (
+        <div className="space-y-6">
+            <Alert>
+                <AlertCircle className="h-4 w-4" />
+                <AlertTitle>Data Quality Index (DQI)</AlertTitle>
+                <AlertDescription>
+                    DQI (0.0 - 1.0) represents your confidence in the data source. Manual surveys = Low DQI, Automated Logs = High DQI. 
+                    Maturity scores are weighted by DQI to penalize low-confidence metrics.
+                </AlertDescription>
+            </Alert>
+            
+            <div className="grid grid-cols-1 gap-6">
+                {domains.map((domain) => (
+                    <Card key={domain.id}>
+                        <CardHeader className="bg-slate-50 border-b py-3">
+                            <div className="flex justify-between items-center">
+                                <CardTitle className="text-base">{domain.id}: {domain.name}</CardTitle>
+                                <div className="flex items-center gap-2">
+                                    <label className="text-xs font-medium text-slate-500">Coverage:</label>
+                                    <input 
+                                        type="range" 
+                                        min="0" max="1" step="0.05"
+                                        value={domain.coverage}
+                                        onChange={(e) => handleCoverageChange(domain.id, parseFloat(e.target.value))}
+                                        className="w-24"
+                                    />
+                                    <span className="text-xs font-bold w-10 text-right">{(domain.coverage * 100).toFixed(0)}%</span>
+                                </div>
+                            </div>
+                        </CardHeader>
+                        <CardContent className="p-0">
+                            <table className="w-full text-sm">
+                                <thead className="bg-slate-50/50 text-slate-500 text-xs uppercase">
+                                    <tr>
+                                        <th className="px-4 py-2 text-left">KPI Name</th>
+                                        <th className="px-4 py-2 w-24">Value (0-100)</th>
+                                        <th className="px-4 py-2 w-24">Weight (0-1)</th>
+                                        <th className="px-4 py-2 w-24">DQI (0-1)</th>
+                                        <th className="px-4 py-2 w-10"></th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-100">
+                                    {domain.kpis.map((kpi, kIndex) => (
+                                        <tr key={kIndex} className="group hover:bg-slate-50/80">
+                                            <td className="px-4 py-2">
+                                                <input 
+                                                    type="text" 
+                                                    value={kpi.name}
+                                                    onChange={(e) => handleKPIChange(domain.id, kIndex, 'name', e.target.value)}
+                                                    className="w-full bg-transparent border-none focus:ring-0 text-slate-700 font-medium"
+                                                />
+                                            </td>
+                                            <td className="px-4 py-2">
+                                                <input 
+                                                    type="number" 
+                                                    value={kpi.value}
+                                                    onChange={(e) => handleKPIChange(domain.id, kIndex, 'value', parseFloat(e.target.value))}
+                                                    className="w-full bg-slate-100 rounded px-2 py-1 text-right focus:bg-white border-transparent focus:border-blue-300"
+                                                />
+                                            </td>
+                                            <td className="px-4 py-2">
+                                                <input 
+                                                    type="number" step="0.05" max="1"
+                                                    value={kpi.weight}
+                                                    onChange={(e) => handleKPIChange(domain.id, kIndex, 'weight', parseFloat(e.target.value))}
+                                                    className="w-full bg-slate-100 rounded px-2 py-1 text-right focus:bg-white border-transparent focus:border-blue-300"
+                                                />
+                                            </td>
+                                            <td className="px-4 py-2">
+                                                <input 
+                                                    type="number" step="0.1" max="1"
+                                                    value={kpi.dqi}
+                                                    onChange={(e) => handleKPIChange(domain.id, kIndex, 'dqi', parseFloat(e.target.value))}
+                                                    className={`w-full rounded px-2 py-1 text-right focus:bg-white border-transparent focus:border-blue-300 ${kpi.dqi < 0.7 ? 'bg-orange-100 text-orange-800' : 'bg-slate-100'}`}
+                                                />
+                                            </td>
+                                            <td className="px-4 py-2 text-center">
+                                                <button 
+                                                    onClick={() => handleRemoveKPI(domain.id, kIndex)}
+                                                    className="text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity"
+                                                >
+                                                    <Trash2 className="w-4 h-4" />
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                            {domain.kpis.length < 6 && (
+                                <div className="p-2 border-t border-slate-100 bg-slate-50/30">
+                                    <button 
+                                        onClick={() => handleAddKPI(domain.id)}
+                                        className="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1 px-2 py-1 rounded hover:bg-blue-50 transition-colors"
+                                    >
+                                        <Plus className="w-3 h-3" /> Add KPI
+                                    </button>
+                                </div>
+                            )}
+                        </CardContent>
+                    </Card>
+                ))}
+            </div>
+        </div>
+      )}
+
+      <div className="text-center text-[10px] text-slate-400 mt-8 pb-4">
+        STIDA v4.1 Consensus Reference • Independent Domains • Dynamic NPV • DQI-Weighted Scoring • Scenario-Specific Effectiveness
+      </div>
+    </div>
+  );
+};
+
+export default STIDACalculator;
