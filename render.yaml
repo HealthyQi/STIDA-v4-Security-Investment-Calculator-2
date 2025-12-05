@@ -1,6 +1,6 @@
 services:
   - type: web
     name: stida-v4-security-investment-calculator-2
-    runtime: static        # <-- this is where "static" belongs
-    buildCommand: npm install && npm run build
-    staticPublishPath: dist   # or "dist" if your build outputs there
+    runtime: static
+    buildCommand: cd frontend && npm install && npm run build
+    staticPublishPath: frontend/dist
