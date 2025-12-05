@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: stida-v4-security-investment-calculator
+    env: static
+    staticPublishPath: build
+    buildCommand: npm install && npm run build
+    startCommand: serve -s build
