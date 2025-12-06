@@ -90,10 +90,8 @@ B — Available budget (Year 1)
 T — Time horizon (years, e.g., 3–5)
 
 r — Discount rate (e.g., 10–15%, may be higher for security to reflect uncertainty)
+
 Tech: React, TypeScript, Recharts | Impact: 8-min workflow, 180-300% typical ROI
-
-Here’s a shorter, story-style **“How STIDA Thinks”** section you can drop into your README or website.
-
 ---
 
 ## How STIDA Thinks (In Human Terms)
